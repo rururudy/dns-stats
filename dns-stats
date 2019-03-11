@@ -1,0 +1,126 @@
+#!/usr/local/bin/perl
+
+# Output dns stats kinda like 'iostat'
+# Currently supports bind.
+# Sun Mar 10 21:17:11 PDT 2019, rudy
+
+use strict;
+
+my $frequency = shift || 1;                    # seconds between updates
+my $conf = '/usr/local/etc/namedb/named.conf'; # find stats file name in conf
+my $max_statfile_size = 100000;                # truncate if bigger; set to 0 to skip.
+
+
+### Find the statistics-file name in the named.conf file
+$conf = "/etc/bind/named.conf" if (! -f $conf && -f "/etc/bind/named.conf"); # ubuntu
+$conf = "/etc/named.conf" if (! -f $conf && -f "/etc/named.conf");           # old bsd
+
+open C, "<$conf" or die "Please configure /some/path/named.conf in $0\n";
+
+my $statfile;
+while (<C>) {
+    $statfile = $1 if /^\s*statistics-file\s+"(.*)"/;
+}
+close C;
+
+$statfile or die "You need to add the statistics-file line in $conf\n";
+
+### If the statfile is not on the file system, create it.
+if (! -f $statfile) {
+    `rndc stats 2> /dev/null`;  # see if can automatically get created...
+    if (! -f $statfile) {
+        my $uid = (getpwnam('bind'))[2];
+        my $gid = (getpwnam('bind'))[3];
+        if ($uid > 0) {
+            open TOUCH,">$statfile" or die "Cannot create $statfile.";
+            close TOUCH;
+            if ($> == 0) {
+                chown $uid, $gid, $statfile;
+            } else {
+                chmod 0666, $statfile; # free for all!
+            }
+            print "Created $statfile\n";
+            `rndc stats`; sleep 1; # get some stats!
+        }
+    }
+}
+
+
+### here is the 'main' -- loop and keep reading info from file
+open my $fh, "<$statfile" or die "Failed to open $statfile.";
+my %stats;
+while (1) {
+    `rndc stats`; # nudge named process
+    &getStats($fh, \%stats);
+    &printStats(\%stats);
+    if ( $max_statfile_size &&  $max_statfile_size > 0 && -s $statfile >  $max_statfile_size) {
+        $|=1;
+        print "truncating $statfile\r";
+        close $fh;
+        truncate $statfile, 0;
+        open $fh, "<$statfile" or die "Failed to open $statfile.";
+    } else {
+        seek($fh, 0, 1);  # clear EOF!
+    }
+    sleep $frequency;
+}
+
+### output the info gathered (customize this to fit your needs...)
+sub printStats {
+    my ($s) = @_;
+    my $qr = $$s{'Incoming Requests'}{'QUERY'}{'rate'};
+    my $nr = $$s{'Incoming Requests'}{'NOTIFY'}{'rate'};
+    my $ur = $$s{'Incoming Requests'}{'UPDATE'}{'rate'};
+    my $ip4r = $$s{'Name Server Statistics'}{'IPv4 requests received'}{'rate'};
+    my $ip6r = $$s{'Name Server Statistics'}{'IPv6 requests received'}{'rate'};
+    my $inr = $$s{'Incoming Queries'}{'total'}{'rate'};
+    my $outr = $$s{'Outgoing Queries'}{'total'}{'rate'};
+    ### meaningless data... my $cacher = $$s{'Cache DB RRsets'}{'total'}{'rate'};
+    my $percent = $ip6r/($ip4r+$ip6r+ .00000001)*100;
+
+    # get speeds!
+    my $resolv_in = $$s{'Resolver Statistics'}{'IPv4 responses received'}{'delta'} + $$s{'Resolver Statistics'}{'IPv6 responses received'}{'delta'};
+
+    my ($speed_fast, $speed_medium, $speed_slow);
+    if ($resolv_in > 0) {
+        $speed_fast = $$s{'Resolver Statistics'}{'queries with RTT < 10ms'}{'delta'} / $resolv_in * 100;
+        $speed_medium = $$s{'Resolver Statistics'}{'queries with RTT 10-100ms'}{'delta'} / $resolv_in * 100;
+        $speed_slow = 100 - $speed_fast - $speed_medium;
+    }
+
+    # OK, print!
+    printf("%5d QUERY/s , %5d/s in, %5d/s out, %2d%% Fast %2d%% OK %2d%% Slow, %.1f%% IPv6\n", 
+			$qr, $inr, $outr, $speed_fast, $speed_medium, $speed_slow, $percent);
+}
+
+### load all the info into the hash (passed via reference)
+sub getStats {
+    my ($fh, $s) = @_;
+    my $section;
+    while (<$fh>) {
+        if (/\+\+\+ Statistics Dump \+\+\+ \((\d+)\)/) {
+            $$s{'time'}{'delta'} = $1 - $$s{'time'}{'value'};
+            $$s{'time'}{'value'} = $1;
+            next;
+        }
+        if (/\+\+ (.*) \+\+/) {
+            $section = $1;
+            $$s{$section}{'total'}{'value'} = $$s{$section}{'total'}{'new'};
+            $$s{$section}{'total'}{'new'} = 0;
+        } elsif ($section && /^\s*(\d+) (.+)$/) {
+            $$s{$section}{$2}{'delta'} = $1 - $$s{$section}{$2}{'value'};
+            $$s{$section}{$2}{'value'} = $1;
+            $$s{$section}{'total'}{'new'} += $1;
+            if ($$s{'time'}{'delta'} > 0) {
+                $$s{$section}{$2}{'rate'} = $$s{$section}{$2}{'delta'} / $$s{'time'}{'delta'};
+            }
+        }
+    }
+    # do tallies per section
+    foreach $section (keys %$s) {
+        next if $section eq 'time';
+        $$s{$section}{'total'}{'delta'} = $$s{$section}{'total'}{'new'} - $$s{$section}{'total'}{'value'};
+        $$s{$section}{'total'}{'value'} = $$s{$section}{'total'}{'new'};
+        $$s{$section}{'total'}{'rate'}  = $$s{$section}{'total'}{'delta'} / $$s{'time'}{'delta'} if ($$s{'time'}{'delta'} > 0);
+    }
+}
