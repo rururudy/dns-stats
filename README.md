@@ -16,3 +16,5 @@ Here is an example of the output:
  1211 QUERY/s ,  1211/s in,   193/s out, 54% Fast 31% OK 13% Slow, 8.4% IPv6
  1168 QUERY/s ,  1168/s in,   194/s out, 64% Fast 23% OK 12% Slow, 7.6% IPv6
 ```
+
+There is lots of other stats available, just edit the printStats routine to change to fit your needs.
